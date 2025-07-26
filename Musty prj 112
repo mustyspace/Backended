@@ -1,0 +1,500 @@
+/auto-news-website
+  /backend
+    package.json
+    server.js
+    /models
+      News.js
+    /routes
+      news.js
+    /services
+      newsFetcher.js
+      videoExtractor.js
+  /frontend
+    package.json
+    public/
+    src/
+      components/
+        NewsCard.js
+        CategoryFilter.js
+      pages/
+        Home.js
+        SinglePost.js
+      App.js
+      App.css
+      index.js
+  docker-compose.yml
+  README.md
+  .gitignore
+{
+  "name": "auto-news-backend",
+  "version": "1.0.0",
+  "description": "Automated news aggregator backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "axios": "^1.3.4",
+    "cheerio": "^1.0.0-rc.12",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "mongoose": "^7.0.2",
+    "node-cron": "^3.0.2",
+    "puppeteer": "^19.7.2"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.20"
+  }
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const cron = require('node-cron');
+const newsRouter = require('./routes/news');
+const { fetchAllNews } = require('./services/newsFetcher');
+
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Database connection
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+})
+.then(() => console.log('Connected to MongoDB'))
+.catch(err => console.error('MongoDB connection error:', err));
+
+// Routes
+app.use('/api/news', newsRouter);
+
+// Scheduled news fetching (every 6 hours)
+cron.schedule('0 */6 * * *', () => {
+  console.log('Running scheduled news fetch...');
+  fetchAllNews().catch(err => console.error('Scheduled fetch error:', err));
+});
+
+// Initial fetch on startup
+fetchAllNews().catch(err => console.error('Initial fetch error:', err));
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const mongoose = require('mongoose');
+
+const newsSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  content: { type: String, required: true },
+  excerpt: { type: String },
+  source: { type: String, required: true },
+  sourceUrl: { type: String, required: true },
+  imageUrl: { type: String },
+  videoUrl: { type: String },
+  categories: [{ type: String }],
+  publishedAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+}, {
+  timestamps: true
+});
+
+// Text index for search
+newsSchema.index({ title: 'text', content: 'text' });
+
+module.exports = mongoose.model('News', newsSchema);
+const express = require('express');
+const router = express.Router();
+const News = require('../models/News');
+
+// Get all news with pagination
+router.get('/', async (req, res) => {
+  try {
+    const { category, page = 1, limit = 20, search } = req.query;
+    const query = {};
+    
+    if (category) query.categories = category;
+    if (search) query.$text = { $search: search };
+
+    const news = await News.find(query)
+      .sort({ publishedAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(parseInt(limit));
+
+    const total = await News.countDocuments(query);
+
+    res.json({
+      news,
+      total,
+      pages: Math.ceil(total / limit),
+      currentPage: parseInt(page)
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Get single news item
+router.get('/:id', async (req, res) => {
+  try {
+    const news = await News.findById(req.params.id);
+    if (!news) return res.status(404).json({ message: 'News not found' });
+    res.json(news);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+module.exports = router;
+const axios = require('axios');
+const cheerio = require('cheerio');
+const puppeteer = require('puppeteer');
+const News = require('../models/News');
+const { extractVideo } = require('./videoExtractor');
+
+const NEWS_SOURCES = [
+  {
+    name: 'BBC News',
+    url: 'https://www.bbc.com/news',
+    selector: '.gs-c-promo',
+    extract: async ($, element) => {
+      const title = $(element).find('.gs-c-promo-heading__title').text().trim();
+      const excerpt = $(element).find('.gs-c-promo-summary').text().trim();
+      const link = $(element).find('a').attr('href');
+      const fullUrl = link.startsWith('http') ? link : `https://www.bbc.com${link}`;
+      
+      // Fetch full article
+      const { content, imageUrl } = await fetchFullArticle(fullUrl);
+      
+      return {
+        title,
+        content: content || excerpt,
+        excerpt,
+        sourceUrl: fullUrl,
+        imageUrl,
+        categories: ['World'] // Default category
+      };
+    }
+  },
+  // Add more sources...
+];
+
+async function fetchFullArticle(url) {
+  try {
+    const browser = await puppeteer.launch();
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: 'networkidle2' });
+    
+    const content = await page.evaluate(() => {
+      return document.querySelector('article')?.innerText || '';
+    });
+    
+    const imageUrl = await page.evaluate(() => {
+      return document.querySelector('article img')?.src || '';
+    });
+    
+    await browser.close();
+    return { content, imageUrl };
+  } catch (err) {
+    console.error(`Error fetching full article from ${url}:`, err);
+    return { content: '', imageUrl: '' };
+  }
+}
+
+async function fetchNewsFromSource(source) {
+  try {
+    const response = await axios.get(source.url);
+    const $ = cheerio.load(response.data);
+    const newsItems = [];
+    
+    $(source.selector).each(async (i, element) => {
+      try {
+        const newsData = await source.extract($, element);
+        
+        // Check if news already exists
+        const existingNews = await News.findOne({ 
+          title: newsData.title,
+          sourceUrl: newsData.sourceUrl 
+        });
+        
+        if (!existingNews) {
+          // Extract video if available
+          newsData.videoUrl = await extractVideo(newsData.content);
+          
+          const news = new News({
+            ...newsData,
+            source: source.name
+          });
+          
+          await news.save();
+          newsItems.push(news);
+        }
+      } catch (err) {
+        console.error(`Error processing news item:`, err);
+      }
+    });
+    
+    return newsItems;
+  } catch (err) {
+    console.error(`Error fetching from ${source.name}:`, err);
+    return [];
+  }
+}
+
+async function fetchAllNews() {
+  let allNews = [];
+  for (const source of NEWS_SOURCES) {
+    const news = await fetchNewsFromSource(source);
+    allNews = [...allNews, ...news];
+  }
+  console.log(`Fetched ${allNews.length} new articles`);
+  return allNews;
+}
+
+module.exports = { fetchAllNews };
+const cheerio = require('cheerio');
+
+function extractVideo(content) {
+  const $ = cheerio.load(content);
+  let videoUrl = '';
+  
+  // Check for YouTube iframes
+  $('iframe').each((i, el) => {
+    const src = $(el).attr('src');
+    if (src && src.includes('youtube.com/embed')) {
+      videoUrl = src;
+      return false; // Break loop
+    }
+  });
+  
+  // Check for YouTube links
+  if (!videoUrl) {
+    $('a').each((i, el) => {
+      const href = $(el).attr('href');
+      if (href && href.includes('youtube.com/watch')) {
+        const videoId = href.split('v=')[1];
+        videoUrl = `https://www.youtube.com/embed/${videoId}`;
+        return false; // Break loop
+      }
+    });
+  }
+  
+  return videoUrl || null;
+}
+
+module.exports = { extractVideo };
+{
+  "name": "auto-news-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^5.16.5",
+    "@testing-library/react": "^13.4.0",
+    "@testing-library/user-event": "^13.5.0",
+    "axios": "^1.3.4",
+    "date-fns": "^2.29.3",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.8.1",
+    "react-scripts": "5.0.1",
+    "sass": "^1.58.3",
+    "web-vitals": "^2.1.4"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
+import { Routes, Route } from 'react-router-dom';
+import Home from './pages/Home';
+import SinglePost from './pages/SinglePost';
+import './App.scss';
+
+function App() {
+  return (
+    <div className="app">
+      <header className="app-header">
+        <h1>AutoNews</h1>
+        <p>Your automated news aggregator</p>
+      </header>
+      
+      <main className="app-main">
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/news/:id" element={<SinglePost />} />
+        </Routes>
+      </main>
+      
+      <footer className="app-footer">
+        <p>© {new Date().getFullYear()} AutoNews - All content automatically aggregated</p>
+      </footer>
+    </div>
+  );
+}
+
+export default App;
+import { Link } from 'react-router-dom';
+import { formatDistanceToNow } from 'date-fns';
+
+const NewsCard = ({ news }) => {
+  return (
+    <article className="news-card">
+      {news.imageUrl && (
+        <div className="news-image">
+          <img src={news.imageUrl} alt={news.title} />
+        </div>
+      )}
+      
+      <div className="news-content">
+        <h2>
+          <Link to={`/news/${news._id}`}>{news.title}</Link>
+        </h2>
+        
+        <p className="excerpt">{news.excerpt}</p>
+        
+        {news.videoUrl && (
+          <div className="video-container">
+            <iframe
+              src={news.videoUrl}
+              title={news.title}
+              frameBorder="0"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowFullScreen
+            />
+          </div>
+        )}
+        
+        <div className="news-meta">
+          <span className="source">{news.source}</span>
+          <span className="date">
+            {formatDistanceToNow(new Date(news.publishedAt), { addSuffix: true })}
+          </span>
+        </div>
+      </div>
+    </article>
+  );
+};
+
+export default NewsCard;
+import { useState, useEffect } from 'react';
+import axios from 'axios';
+import NewsCard from '../components/NewsCard';
+import CategoryFilter from '../components/CategoryFilter';
+
+const Home = () => {
+  const [news, setNews] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [category, setCategory] = useState('');
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+
+  useEffect(() => {
+    const fetchNews = async () => {
+      try {
+        setLoading(true);
+        const response = await axios.get(`/api/news?category=${category}&page=${page}`);
+        setNews(response.data.news);
+        setTotalPages(response.data.pages);
+      } catch (error) {
+        console.error('Error fetching news:', error);
+      } finally {
+        setLoading(false);
+      }
+    };
+    
+    fetchNews();
+  }, [category, page]);
+
+  return (
+    <div className="home-page">
+      <CategoryFilter 
+        currentCategory={category} 
+        onSelectCategory={setCategory} 
+      />
+      
+      {loading ? (
+        <div className="loading">Loading news...</div>
+      ) : (
+        <>
+          <div className="news-grid">
+            {news.map(item => (
+              <NewsCard key={item._id} news={item} />
+            ))}
+          </div>
+          
+          <div className="pagination">
+            {Array.from({ length: totalPages }, (_, i) => i + 1).map(num => (
+              <button
+                key={num}
+                onClick={() => setPage(num)}
+                className={page === num ? 'active' : ''}
+              >
+                {num}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+export default Home;
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017/autonews
+      - PORT=5000
+    depends_on:
+      - mongo
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://backend:5000
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+  mongo:
+    image: mongo:5.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+volumes:
+  mongo-data:
